@@ -42,6 +42,7 @@ model Cuenta {
   hash         String
   rol          Rol
   estado       EstadoCuenta @default(pending)
+  avatarURL    String?
   creadoEn     DateTime     @default(now())
   confirmadoEn DateTime?
   eliminadoEn  DateTime?
