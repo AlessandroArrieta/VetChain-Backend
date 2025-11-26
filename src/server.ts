@@ -17,8 +17,10 @@ const app = express();
 const prisma = new PrismaClient();
 const uploadsRoot = path.resolve(process.cwd(), "uploads");
 const docsRoot = path.join(uploadsRoot, "docs");
+const avatarsRoot = path.join(uploadsRoot, "avatars");
 
 await fs.mkdir(docsRoot, { recursive: true });
+await fs.mkdir(avatarsRoot, { recursive: true });
 
 app.use(cors());
 app.use(express.json({ limit: "5mb" }));
@@ -131,6 +133,25 @@ async function saveDocument(base64data: string | undefined, label: string) {
   return `/uploads/docs/${filename}`;
 }
 
+async function saveAvatar(base64data: string | undefined, cuentaId: string) {
+  if (!base64data) return undefined;
+  let payload = base64data.trim();
+  let mime = "image/png";
+  if (payload.startsWith("data:")) {
+    const [, meta, data] = payload.match(/^data:(.*?);base64,(.*)$/) ?? [];
+    if (!meta || !data) throw new Error("Archivo adjunto invalido");
+    mime = meta;
+    payload = data;
+  }
+  if (!mime.startsWith("image/")) throw new Error("El archivo debe ser una imagen");
+  const buffer = Buffer.from(payload, "base64");
+  if (!buffer.length) throw new Error("Archivo adjunto vacio");
+  const filename = `avatar-${cuentaId}-${Date.now()}${mimeToExtension(mime)}`;
+  const filePath = path.join(avatarsRoot, filename);
+  await fs.writeFile(filePath, buffer);
+  return `/uploads/avatars/${filename}`;
+}
+
 async function ensureAdmin() {
   const adminEmail = "admin@vetchain.com";
   const exists = await prisma.cuenta.findUnique({ where: { correo: adminEmail } });
@@ -165,15 +186,48 @@ const transporter =
 async function sendEmail(to: string, subject: string, message: string) {
   if (!to) return;
   const from = process.env.SMTP_FROM || "no-reply@vetchain.local";
+  const html = renderEmailTemplate(subject, message);
   if (!transporter) {
     console.log(`[EMAIL MOCK] ${subject} -> ${to}\n${message}`);
     return;
   }
   try {
-    await transporter.sendMail({ from, to, subject, text: message });
+    await transporter.sendMail({ from, to, subject, text: message, html });
   } catch (err) {
     console.error("Error enviando correo:", err);
   }
+}
+
+function renderEmailTemplate(title: string, body: string) {
+  const formatted = body
+    .split(/\n+/)
+    .filter(Boolean)
+    .map((line) => `<p style="margin: 0 0 12px; color:#334155;">${line.trim()}</p>`)
+    .join("");
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${title}</title>
+  </head>
+  <body style="font-family: 'Segoe UI', Arial, sans-serif; background-color:#f8fafc; padding:24px;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px; margin:0 auto; background-color:#ffffff; border-radius:16px; border:1px solid #e2e8f0; box-shadow:0 6px 25px rgba(15,23,42,0.08);">
+      <tr>
+        <td style="padding:24px;">
+          <div style="text-align:center; margin-bottom:20px;">
+            <div style="display:inline-flex; align-items:center; gap:8px; font-size:20px; font-weight:700; color:#0f766e;">
+              <span style="display:inline-flex; width:40px; height:40px; border-radius:50%; border:1px solid #99f6e4; align-items:center; justify-content:center;">🐾</span>
+              VetChain
+            </div>
+          </div>
+          <h1 style="font-size:20px; color:#0f172a; margin:0 0 16px;">${title}</h1>
+          ${formatted}
+          <p style="margin-top:24px; font-size:12px; color:#94a3b8;">Este mensaje se generó automáticamente. Si no reconoces esta acción contáctanos.</p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
 }
 
 // Helper utilities ----------------------------------------------------------
@@ -379,6 +433,8 @@ app.put("/me", auth(), async (req, res) => {
   if (!cuenta) return res.status(404).json({ error: "Cuenta no encontrada" });
 
   const { correo, telefono, nombres, apellidos, direccion, nombre, especialidad, actualContrasena, nuevaContrasena } = req.body || {};
+  const { avatarData, removeAvatar } = req.body || {};
+  const cuentaPatch: Prisma.CuentaUpdateInput = {};
 
   if (correo) {
     if (!isValidEmail(correo)) return res.status(400).json({ error: "Correo inválido" });
@@ -398,7 +454,21 @@ app.put("/me", auth(), async (req, res) => {
   }
 
   if (correo && correo !== cuenta.correo) {
-    await prisma.cuenta.update({ where: { id: cuenta.id }, data: { correo } });
+    cuentaPatch.correo = correo;
+  }
+
+  if (avatarData) {
+    try {
+      cuentaPatch.avatarURL = await saveAvatar(avatarData, cuenta.id);
+    } catch (error) {
+      return res.status(400).json({ error: "No se pudo procesar la imagen de perfil" });
+    }
+  } else if (removeAvatar) {
+    cuentaPatch.avatarURL = null;
+  }
+
+  if (Object.keys(cuentaPatch).length > 0) {
+    await prisma.cuenta.update({ where: { id: cuenta.id }, data: cuentaPatch });
   }
 
   if (cuenta.rol === "dueno") {
@@ -497,10 +567,14 @@ app.get("/veterinarios/activos", async (req, res) => {
       cuenta: { estado: "active" as EstadoCuenta },
       ...(centroId ? { centroId } : {}),
     },
-    include: { centro: true },
+    include: { centro: true, cuenta: { select: { avatarURL: true } } },
     orderBy: { nombre: "asc" },
   });
-  return res.json(vets);
+  const payload = vets.map((vet) => {
+    const { cuenta, ...rest } = vet as typeof vet & { cuenta?: { avatarURL: string | null } };
+    return { ...rest, avatarURL: cuenta?.avatarURL ?? null };
+  });
+  return res.json(payload);
 });
 
 app.post("/centros", auth(), async (req, res) => {
